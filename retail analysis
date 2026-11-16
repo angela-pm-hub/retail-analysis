@@ -1,0 +1,231 @@
+/*  ANÁLISIS DE DESEMPEÑO COMERCIAL EN RETAIL
+ 
+   Los datos son simulados, no pertenecen a ninguna empresa real. El efecto de la promoción y los
+
+   DESCRIPCIÓN
+
+   Objetivo:
+   Practicar un análisis de negocio; cómo evolucionan las ventas, qué tiendas y productos rinden mejor, cómo se comportan los clientes y si una promoción funcionó.
+
+   Simulé y limpié los datos con Python, armé las tablas (tiendas, productos, clientes y ventas) y escribí las consultas SQL para responder cada pregunta.
+
+   Resultados:
+   - Limpié las líneas de venta, quite duplicados, corregí cantidades atípicas y completé precios vacíos.
+   - Las ventas de 2025 subieron 9.0% contra 2024. Los tickets subieron 5.3% y el ticket promedio pasó de $151 a $157. El margen quedó en ~31%.
+   - Ventas por m2: las tiendas Express venden más por m2 (158 a 255) que las Supermercado (58 a 110) y las Hipermercado (41 a 62).
+   - ABC: 25 de los 48 productos suman 78.6% de la venta y 10 productos solo aportan 5.8%.
+   - Clientes (RFM): el 32.5% de los clientes ("Leales") genera el 66.5% del gasto. Otro 17.5% compraba seguido pero ya no regresa ("En riesgo") y representa 22.5% del gasto.
+   - Promoción en Cuidado Personal: en las 10 tiendas con promoción,
+     las ventas subieron 23.2% y las unidades 31.5%, contra +1.4% y -2.2% en las 15 tiendas sin promoción. El margen bajó 2.4% en las tiendas con promoción, así que vendió más pero no ganó más.
+
+   Decisiones
+   - Usé SQL para todo el análisis y Python solo para crear y limpiar los datos, porque quería practicar consultas con datos más  parecidos a los de una empresa.
+   - Armé una tabla de ventas y tres de catálogo para no repetir información en cada línea.
+   - Comparé cada mes contra el mismo mes del año anterior porque las ventas suben en noviembre y diciembre, y  comparar contra el mes anterior habría confundido temporada
+     con crecimiento.
+
+   Desafíos
+   1. Duplicados. Al limpiar vi que un producto puede aparecer dos veces en un mismo ticket de forma válida. Si borraba todas las filas repetidas, hubiera eliminado ventas reales. Lo resolví
+      usando ticket + número de línea como llave y borrando solo los duplicados exactos.
+   2. Valores vacíos. Al importar los CSV, las compras sin tarjeta de lealtad quedaban con texto vacío y no con NULL, afectando los filtros de clientes. Lo corregí con un UPDATE después de
+      importar.
+   3. Ranking de tiendas. Las Express salían siempre arriba en ventas por m2 solo porque son pequeñas. Para que la comparación fuera más precis ordené cada tienda dentro de su mismo formato con
+      RANK() y PARTITION BY.
+   4. Promoción. Como segundo semestre siempre vende más, no es apropiado comparar antes y después. Comparé el mismo semestre de 2024 contra 2025 y puse un grupo de tiendas sin
+      promoción como referencia. Con solo 10 y 15 tiendas no hice una  prueba estadística, así que el resultado es orientativo.
+
+
+   EJECUCIÓN
+   Desde la carpeta del proyecto, con el cliente sqlite3:
+       sqlite3 retail.db ".read analisis_retail.sql"
+ 
+   Para regenerar los datos:
+       python scripts/generar_datos.py
+       python scripts/limpiar_datos.py
+
+*/
+
+
+/* PARTE 1. CREAR TABLAS E IMPORTAR LOS CSV (ejecutar con el cliente sqlite3) */
+
+.headers on
+.mode column
+
+DROP TABLE IF EXISTS fact_ventas;
+DROP TABLE IF EXISTS dim_tienda;
+DROP TABLE IF EXISTS dim_producto;
+DROP TABLE IF EXISTS dim_cliente;
+
+CREATE TABLE dim_tienda (
+    id_tienda TEXT PRIMARY KEY, ciudad TEXT, formato TEXT,
+    area_m2 INTEGER, promo_cuidado_personal INTEGER
+);
+CREATE TABLE dim_producto (
+    id_producto TEXT PRIMARY KEY, producto TEXT, categoria TEXT,
+    precio_lista REAL, costo_unitario REAL
+);
+CREATE TABLE dim_cliente (
+    id_cliente TEXT PRIMARY KEY, ciudad TEXT, fecha_alta TEXT
+);
+CREATE TABLE fact_ventas (
+    id_ticket TEXT, linea INTEGER, fecha TEXT, id_tienda TEXT, id_cliente TEXT,
+    canal TEXT, id_producto TEXT, cantidad INTEGER, precio_unitario REAL,
+    venta REAL, costo REAL, margen REAL
+);
+
+.import --csv --skip 1 data/dim_tienda.csv dim_tienda
+.import --csv --skip 1 data/dim_producto.csv dim_producto
+.import --csv --skip 1 data/dim_cliente.csv dim_cliente
+.import --csv --skip 1 data/fact_ventas.csv fact_ventas
+
+-- Las compras sin tarjeta de lealtad llegan como texto vacio; las paso a NULL
+UPDATE fact_ventas SET id_cliente = NULL WHERE id_cliente = '';
+
+-- Revision rapida: deben ser 85,093 lineas y 30,350 tickets
+SELECT COUNT(*) AS lineas, COUNT(DISTINCT id_ticket) AS tickets FROM fact_ventas;
+
+
+/*   PARTE 2. CONSULTAS */
+
+-- 
+-- 1. KPIs por año: ventas, tickets, ticket promedio y margen
+-- 
+SELECT
+    SUBSTR(fecha, 1, 4)                                AS año,
+    ROUND(SUM(venta), 0)                               AS ventas,
+    COUNT(DISTINCT id_ticket)                          AS tickets,
+    ROUND(SUM(venta) / COUNT(DISTINCT id_ticket), 2)   AS ticket_promedio,
+    ROUND(SUM(margen) * 100.0 / SUM(venta), 1)         AS margen_pct
+FROM fact_ventas
+GROUP BY año;
+
+
+--
+-- 2. Ventas por mes y variacion contra el mismo mes del año anterior
+--    (LAG de 12 meses, porque las ventas cambian por temporada)
+-- 
+WITH mensual AS (
+    SELECT SUBSTR(fecha, 1, 7) AS mes, SUM(venta) AS ventas
+    FROM fact_ventas
+    GROUP BY mes
+)
+SELECT
+    mes,
+    ROUND(ventas, 0) AS ventas,
+    ROUND((ventas / LAG(ventas, 12) OVER (ORDER BY mes) - 1) * 100, 1) AS var_anual_pct
+FROM mensual
+ORDER BY mes;
+
+-- 3. Ranking de tiendas 2025 por ventas por m2
+--    Se compara cada tienda contra las de su mismo formato
+-- 
+WITH tienda AS (
+    SELECT t.id_tienda, t.ciudad, t.formato, t.area_m2, SUM(f.venta) AS ventas
+    FROM fact_ventas f
+    JOIN dim_tienda t ON t.id_tienda = f.id_tienda
+    WHERE f.fecha >= '2025-01-01'
+    GROUP BY t.id_tienda, t.ciudad, t.formato, t.area_m2
+)
+SELECT
+    id_tienda, ciudad, formato,
+    ROUND(ventas / area_m2, 0)                                          AS ventas_por_m2,
+    RANK() OVER (PARTITION BY formato ORDER BY ventas / area_m2 DESC)   AS lugar_en_su_formato
+FROM tienda
+ORDER BY formato, lugar_en_su_formato;
+
+-- 
+-- 4. Analisis ABC de productos 2025
+--    A = los que suman el primer 80% de la venta, B = hasta 95%, C = el resto
+-- 
+WITH producto AS (
+    SELECT p.id_producto, p.categoria, SUM(f.venta) AS ventas
+    FROM fact_ventas f
+    JOIN dim_producto p ON p.id_producto = f.id_producto
+    WHERE f.fecha >= '2025-01-01'
+    GROUP BY p.id_producto, p.categoria
+),
+acumulado AS (
+    SELECT *,
+        SUM(ventas) OVER (ORDER BY ventas DESC) * 100.0 / SUM(ventas) OVER () AS venta_acumulada_pct
+    FROM producto
+),
+clasificado AS (
+    SELECT *,
+        CASE WHEN venta_acumulada_pct <= 80 THEN 'A'
+             WHEN venta_acumulada_pct <= 95 THEN 'B'
+             ELSE 'C' END AS clase
+    FROM acumulado
+)
+SELECT
+    clase,
+    COUNT(*)                                          AS productos,
+    ROUND(SUM(ventas) * 100.0 / (SELECT SUM(ventas) FROM producto), 1) AS pct_de_la_venta
+FROM clasificado
+GROUP BY clase
+ORDER BY clase;
+
+
+-- 
+-- 5. Segmentacion de clientes con RFM (solo clientes con tarjeta, 2024-2025)
+--    R = dias desde la ultima compra, F = numero de tickets, M = gasto total
+--    Cada una se divide en 4 grupos con NTILE (4 = mejor)
+-- 
+WITH cliente AS (
+    SELECT
+        id_cliente,
+        CAST(julianday('2025-12-31') - julianday(MAX(fecha)) AS INTEGER) AS dias_sin_comprar,
+        COUNT(DISTINCT id_ticket)                                        AS tickets,
+        SUM(venta)                                                       AS gasto
+    FROM fact_ventas
+    WHERE id_cliente IS NOT NULL
+    GROUP BY id_cliente
+),
+puntaje AS (
+    SELECT *,
+        NTILE(4) OVER (ORDER BY dias_sin_comprar DESC) AS r,
+        NTILE(4) OVER (ORDER BY tickets)               AS f
+    FROM cliente
+),
+segmento AS (
+    SELECT *,
+        CASE WHEN r >= 3 AND f >= 3 THEN 'Leales'
+             WHEN r <= 2 AND f >= 3 THEN 'En riesgo'
+             WHEN r >= 3 AND f <= 2 THEN 'Recientes u ocasionales'
+             ELSE 'Dormidos' END AS segmento
+    FROM puntaje
+)
+SELECT
+    segmento,
+    COUNT(*)                                                       AS clientes,
+    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM segmento), 1)   AS pct_clientes,
+    ROUND(SUM(gasto) * 100.0 / (SELECT SUM(gasto) FROM segmento), 1) AS pct_gasto
+FROM segmento
+GROUP BY segmento
+ORDER BY pct_gasto DESC;
+
+-- 
+-- 6. Promocion en Cuidado Personal (jul-dic 2025)
+--    Comparo el segundo semestre de 2025 contra el de 2024,  en tiendas con promocion y sin promocion
+--
+WITH grupo AS (
+    SELECT
+        CASE t.promo_cuidado_personal WHEN 1 THEN 'Con promocion' ELSE 'Sin promocion' END AS grupo,
+        COUNT(DISTINCT t.id_tienda) AS tiendas,
+        SUM(CASE WHEN f.fecha BETWEEN '2024-07-01' AND '2024-12-31' THEN f.venta    END) AS ventas_2024,
+        SUM(CASE WHEN f.fecha BETWEEN '2025-07-01' AND '2025-12-31' THEN f.venta    END) AS ventas_2025,
+        SUM(CASE WHEN f.fecha BETWEEN '2024-07-01' AND '2024-12-31' THEN f.cantidad END) AS unidades_2024,
+        SUM(CASE WHEN f.fecha BETWEEN '2025-07-01' AND '2025-12-31' THEN f.cantidad END) AS unidades_2025,
+        SUM(CASE WHEN f.fecha BETWEEN '2024-07-01' AND '2024-12-31' THEN f.margen   END) AS margen_2024,
+        SUM(CASE WHEN f.fecha BETWEEN '2025-07-01' AND '2025-12-31' THEN f.margen   END) AS margen_2025
+    FROM fact_ventas f
+    JOIN dim_producto p ON p.id_producto = f.id_producto
+    JOIN dim_tienda   t ON t.id_tienda   = f.id_tienda
+    WHERE p.categoria = 'Cuidado Personal'
+    GROUP BY grupo
+)
+SELECT
+    grupo, tiendas,
+    ROUND((ventas_2025   * 1.0 / ventas_2024   - 1) * 100, 1) AS var_ventas_pct,
+    ROUND((unidades_2025 * 1.0 / unidades_2024 - 1) * 100, 1) AS var_unidades_pct,
+    ROUND((margen_2025   * 1.0 / margen_2024   - 1) * 100, 1) AS var_margen_pct
+FROM grupo;
